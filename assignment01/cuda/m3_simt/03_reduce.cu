@@ -1,63 +1,204 @@
-// 问题 3.5：block 内求和归约。
+// Problem 3.5: Sum reduction within a block.
 //
-// 任务：从零实现下面两个 kernel。main 里的判测与计时已经写好，不要改。
+// Task: Implement the following two kernels from scratch. The correctness
+// checks and timing code in main are already provided; do not modify them.
 //
-// contract（两个 kernel 相同的部分）：
-//   - launch 配置是 <<<nblocks, BLOCK>>>，BLOCK = 256；
-//   - 第 b 个 block 负责 in[b*BLOCK] 到 in[b*BLOCK + 255] 这 256 个元素，
-//     把它们的和写进 out[b]（归约结束后由一个线程写出，通常是 tid == 0）；
-//   - 求和在 shared memory 里做：每个线程先把自己对应的那个元素搬进
-//     __shared__ float buf[BLOCK]，之后的加法全部在 buf 上进行；
-//   - 每一轮配对加法前后都要 __syncthreads()
+// Contract—the parts shared by both kernels:
 //
-// 两个 kernel 的区别只在“每一轮由哪些线程做加法、加哪个位置”：
-//   - reduce_interleaved（交错配对）：步长 s 取 1, 2, 4, ..., 128，
-//     每轮由 tid % (2*s) == 0 的线程执行 buf[tid] += buf[tid + s]。
-//     以 8 个元素为例：
-//       s=1: buf[0]+=buf[1]  buf[2]+=buf[3]  buf[4]+=buf[5]  buf[6]+=buf[7]
-//            （tid 0、2、4、6 干活，活跃线程在 warp 里隔一个一个）
-//       s=2: buf[0]+=buf[2]  buf[4]+=buf[6]   （tid 0、4 干活）
-//       s=4: buf[0]+=buf[4]                   （tid 0 干活）
-//   - reduce_contiguous（连续配对）：步长 s 取 128, 64, ..., 1，
-//     每轮由 tid < s 的线程执行 buf[tid] += buf[tid + s]。同样 8 个元素：
-//       s=4: buf[0]+=buf[4]  buf[1]+=buf[5]  buf[2]+=buf[6]  buf[3]+=buf[7]
-//            （tid 0-3 干活，活跃线程挤在编号低的一头）
-//       s=2: buf[0]+=buf[2]  buf[1]+=buf[3]   （tid 0、1 干活）
-//       s=1: buf[0]+=buf[1]                   （tid 0 干活）
-//   两版加法次数完全相同，区别只在活跃线程在 warp 里怎么分布
+//   - The launch configuration is <<<nblocks, BLOCK>>>, where BLOCK = 256.
 //
-// 注意：两个 kernel 里循环的上下界都用 blockDim.x（运行期值）来写，
-// 不要用宏 BLOCK。用编译期常量会让编译器把循环完全展开、把 % 优化成
-// 位运算，影响性能比较。
+//   - Block b is responsible for the 256 elements from:
 //
-// 写完运行，两个版本都 PASS 后，记录耗时和比值并解释差距。
+//         in[b * BLOCK]
 //
-// 选做第三版（shuffle 版）时：测试只会跑上面两个 kernel，自己在 main 里
-// 照着加一次 run_one 调用即可，不影响前两版的测试。
+//     through:
+//
+//         in[b * BLOCK + 255]
+//
+//     It must calculate their sum and write it into out[b]. After the
+//     reduction finishes, one thread—normally tid == 0—writes the result.
+//
+//   - Perform the summation in shared memory. Each thread first moves its
+//     corresponding input element into:
+//
+//         __shared__ float buf[BLOCK]
+//
+//     All subsequent additions must operate on buf.
+//
+//   - Call __syncthreads() before and after the paired additions in every
+//     reduction round.
+//
+// The only difference between the two kernels is which threads perform the
+// additions in each round and which positions they add:
+//
+//   - reduce_interleaved—interleaved pairing:
+//
+//     The stride s takes the values 1, 2, 4, ..., 128.
+//
+//     In every round, threads satisfying:
+//
+//         tid % (2 * s) == 0
+//
+//     perform:
+//
+//         buf[tid] += buf[tid + s]
+//
+//     Example with eight elements:
+//
+//       s = 1:
+//         buf[0] += buf[1]
+//         buf[2] += buf[3]
+//         buf[4] += buf[5]
+//         buf[6] += buf[7]
+//
+//         Threads 0, 2, 4, and 6 work. Active threads are interleaved
+//         with inactive threads within the warp.
+//
+//       s = 2:
+//         buf[0] += buf[2]
+//         buf[4] += buf[6]
+//
+//         Threads 0 and 4 work.
+//
+//       s = 4:
+//         buf[0] += buf[4]
+//
+//         Only thread 0 works.
+//
+//   - reduce_contiguous—contiguous pairing:
+//
+//     The stride s takes the values 128, 64, ..., 1.
+//
+//     In every round, threads satisfying:
+//
+//         tid < s
+//
+//     perform:
+//
+//         buf[tid] += buf[tid + s]
+//
+//     Example with eight elements:
+//
+//       s = 4:
+//         buf[0] += buf[4]
+//         buf[1] += buf[5]
+//         buf[2] += buf[6]
+//         buf[3] += buf[7]
+//
+//         Threads 0–3 work. The active threads are grouped together at the
+//         low-index end.
+//
+//       s = 2:
+//         buf[0] += buf[2]
+//         buf[1] += buf[3]
+//
+//         Threads 0 and 1 work.
+//
+//       s = 1:
+//         buf[0] += buf[1]
+//
+//         Only thread 0 works.
+//
+//   Both versions perform exactly the same number of additions. The only
+//   difference is how the active threads are distributed within each warp.
+//
+// Important: Write the loop bounds in both kernels using blockDim.x—the
+// runtime value—not the BLOCK macro. Using a compile-time constant would
+// allow the compiler to completely unroll the loops and optimize % into
+// bitwise operations, affecting the performance comparison.
+//
+// After implementing the kernels, run the program. Once both versions produce
+// PASS, record their execution times and ratio and explain the difference.
+//
+// Optional third version—shuffle reduction:
+//
+// The tests run only the two kernels above. You may add another run_one call
+// in main for your shuffle version without affecting the tests for the first
+// two implementations.
+
 #include "common.h"
 
 #define BLOCK 256
 
 __global__ void reduce_interleaved(const float *in, float *out) {
-    // TODO：从这里开始写（交错配对版本）
+    // TODO: Begin implementing the interleaved-pairing version here.
+
+    __shared__ float buf[BLOCK];
+
+    int t = threadIdx.x;
+    int base = blockIdx.x * BLOCK;
+    int tid = t + base;
+
+    buf[t] = in[tid];
+    __syncthreads();
+
+    for(int s = 1; s<=blockDim.x/2; s*=2){
+        if (t % (2 * s) == 0){
+            buf[t] += buf[t+s];
+        }
+        __syncthreads();
+    }
+
+    if (t==0){
+        out[blockIdx.x] = buf[0];
+    }
+
+
+
 }
 
 __global__ void reduce_contiguous(const float *in, float *out) {
-    // TODO：从这里开始写（连续配对版本）
+    // TODO: Begin implementing the contiguous-pairing version here.
+    __shared__ float buf[BLOCK];
+
+    int t = threadIdx.x;
+    int base = blockIdx.x * BLOCK;
+    int tid = t + base;
+
+    buf[t] = in[tid];
+    __syncthreads();
+
+    for(int s = blockDim.x/2; s>=1; s=s/2){
+        if(t<s){
+            buf[t]+=buf[t+s];
+        }
+        __syncthreads();
+    }
+    
+    if (t==0){
+        out[blockIdx.x] = buf[0];
+    }
 }
 
-// ---------------- 以下是判测与计时，不要修改 ----------------
+// ------------- Correctness checks and timing below—do not modify -------------
 
 typedef void (*reduce_fn)(const float *, float *);
 
-static float run_one(reduce_fn fn, const char *name, const float *d_in,
-                     float *d_out, float *h_out, const float *h_partial,
-                     int nblocks) {
-    CUDA_CHECK(cudaMemset(d_out, 0, nblocks * sizeof(float)));
+static float run_one(
+    reduce_fn fn,
+    const char *name,
+    const float *d_in,
+    float *d_out,
+    float *h_out,
+    const float *h_partial,
+    int nblocks
+) {
+    CUDA_CHECK(cudaMemset(
+        d_out,
+        0,
+        nblocks * sizeof(float)
+    ));
+
     fn<<<nblocks, BLOCK>>>(d_in, d_out);
     CUDA_CHECK_KERNEL();
-    CUDA_CHECK(cudaMemcpy(h_out, d_out, nblocks * sizeof(float),
-                          cudaMemcpyDeviceToHost));
+
+    CUDA_CHECK(cudaMemcpy(
+        h_out,
+        d_out,
+        nblocks * sizeof(float),
+        cudaMemcpyDeviceToHost
+    ));
+
     if (!check_close(h_out, h_partial, nblocks, 1e-3f)) {
         printf("%s: FAIL\n", name);
         emit_result("3.5", "fail", "{}");
@@ -66,11 +207,17 @@ static float run_one(reduce_fn fn, const char *name, const float *d_in,
 
     const int reps = 200;
     GpuTimer timer;
+
     timer.start();
-    for (int r = 0; r < reps; r++) fn<<<nblocks, BLOCK>>>(d_in, d_out);
+
+    for (int r = 0; r < reps; r++)
+        fn<<<nblocks, BLOCK>>>(d_in, d_out);
+
     float ms = timer.stop_ms() / reps;
     CUDA_CHECK_KERNEL();
-    printf("%s: PASS  平均 %.4f ms\n", name, ms);
+
+    printf("%s: PASS  average %.4f ms\n", name, ms);
+
     return ms;
 }
 
@@ -82,30 +229,81 @@ int main() {
     float *h_in = (float *)malloc(bytes);
     float *h_out = (float *)malloc(nblocks * sizeof(float));
     float *h_partial = (float *)malloc(nblocks * sizeof(float));
+
     fill_random(h_in, n, 11);
+
     for (int b = 0; b < nblocks; b++) {
         double s = 0;
-        for (int t = 0; t < BLOCK; t++) s += h_in[b * BLOCK + t];
+
+        for (int t = 0; t < BLOCK; t++)
+            s += h_in[b * BLOCK + t];
+
         h_partial[b] = (float)s;
     }
 
     float *d_in, *d_out;
-    CUDA_CHECK(cudaMalloc(&d_in, bytes));
-    CUDA_CHECK(cudaMalloc(&d_out, nblocks * sizeof(float)));
-    CUDA_CHECK(cudaMemcpy(d_in, h_in, bytes, cudaMemcpyHostToDevice));
 
-    float ms_i = run_one(reduce_interleaved, "interleaved", d_in, d_out, h_out,
-                         h_partial, nblocks);
-    float ms_c = run_one(reduce_contiguous, "contiguous ", d_in, d_out, h_out,
-                         h_partial, nblocks);
-    // 阈值 1.5x：A100 实测 2.22x、V100 实测 2.33x，两版写成一样时是 ~1x。
-    float ratio = report_speedup("interleaved / contiguous", ms_i, ms_c, 1.5f,
-                                 "两版耗时几乎一样，检查是不是写成同一个实现了");
+    CUDA_CHECK(cudaMalloc(&d_in, bytes));
+    CUDA_CHECK(cudaMalloc(
+        &d_out,
+        nblocks * sizeof(float)
+    ));
+
+    CUDA_CHECK(cudaMemcpy(
+        d_in,
+        h_in,
+        bytes,
+        cudaMemcpyHostToDevice
+    ));
+
+    float ms_i = run_one(
+        reduce_interleaved,
+        "interleaved",
+        d_in,
+        d_out,
+        h_out,
+        h_partial,
+        nblocks
+    );
+
+    float ms_c = run_one(
+        reduce_contiguous,
+        "contiguous ",
+        d_in,
+        d_out,
+        h_out,
+        h_partial,
+        nblocks
+    );
+
+    // Threshold: 1.5×.
+    //
+    // Measurements:
+    //   A100: 2.22×
+    //   V100: 2.33×
+    //
+    // If both kernels are implemented identically, the ratio is approximately 1×.
+    float ratio = report_speedup(
+        "interleaved / contiguous",
+        ms_i,
+        ms_c,
+        1.5f,
+        "The execution times are almost identical; check whether both "
+        "kernels were implemented in the same way."
+    );
 
     char metrics[192];
-    snprintf(metrics, sizeof(metrics),
-             "{\"interleaved_ms\":%.4f,\"contiguous_ms\":%.4f,\"ratio\":%.3f}",
-             ms_i, ms_c, ratio);
+
+    snprintf(
+        metrics,
+        sizeof(metrics),
+        "{\"interleaved_ms\":%.4f,\"contiguous_ms\":%.4f,\"ratio\":%.3f}",
+        ms_i,
+        ms_c,
+        ratio
+    );
+
     emit_result("3.5", "pass", metrics);
+
     return 0;
 }
