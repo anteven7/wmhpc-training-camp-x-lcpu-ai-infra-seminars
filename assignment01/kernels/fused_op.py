@@ -1,10 +1,22 @@
-"""问题 7.2：fused elementwise（改造题）。
+"""Problem 7.2: Fused elementwise operation (modification task).
 
-scale_kernel 目前功能完整，相应代码不要变动。
-fused_kernel 目前和 scale_kernel 完全一致，是你需要修改的 kernel。
-任务：改成 z = relu(a * x + b)，其中 a、b 是标量。
-TIP: 只需要动计算那一行，再把 a、b 传进 kernel——主体不变，
-这正是 Tile 视角的好处:-)。改完运行：
+scale_kernel is currently complete. Do not modify its corresponding code.
+
+fused_kernel is currently identical to scale_kernel and is the kernel that you
+need to modify.
+
+Task: Change it so that it computes:
+
+    z = relu(a * x + b)
+
+where a and b are scalars.
+
+TIP: You only need to change the computation line and pass a and b into the
+kernel—the main structure remains unchanged. This is precisely the advantage
+of the tile perspective :-).
+
+After making the changes, run:
+
     pytest tests/test_fused_op.py
 """
 
@@ -32,15 +44,21 @@ def scale(x: torch.Tensor) -> torch.Tensor:
     return z
 
 
-# ====== 从这里开始改 ======
+# ===== Modify from this point onward =====
 
 @triton.jit
-def fused_kernel(x_ptr, z_ptr, n, BLOCK_SIZE: tl.constexpr):
+def fused_kernel(x_ptr, a, b, z_ptr, n, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(0)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n
+
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    z = x * 2.0  # TODO：改成 relu(a * x + b)，提示 tl.maximum
+    x = a*x+b
+
+    # TODO: Change this to relu(a * x + b).
+    # Hint: use tl.maximum.
+    z = tl.maximum(x,0.0)
+
     tl.store(z_ptr + offsets, z, mask=mask)
 
 
@@ -49,5 +67,8 @@ def fused(x: torch.Tensor, a: float, b: float) -> torch.Tensor:
     n = x.numel()
     BLOCK_SIZE = 1024
     grid = (triton.cdiv(n, BLOCK_SIZE),)
-    fused_kernel[grid](x, z, n, BLOCK_SIZE=BLOCK_SIZE)  # TODO：把 a、b 传进去
+
+    # TODO: Pass a and b into the kernel.
+    fused_kernel[grid](x, a, b, z, n, BLOCK_SIZE=BLOCK_SIZE)
+
     return z
